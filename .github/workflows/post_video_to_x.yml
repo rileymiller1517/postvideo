@@ -18,12 +18,19 @@ on:
         description: "Pick a random video instead of oldest first? (true/false)"
         required: false
         default: "false"
+      interval_minutes:
+        description: "Minutes between each post (default: 30)"
+        required: false
+        default: "30"
+      max_posts:
+        description: "Max posts per run, 0 = post until folder is empty"
+        required: false
+        default: "0"
 
 jobs:
   post-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 360   # 6 hours — adjust to how many posts you need
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +47,7 @@ jobs:
             google-auth-httplib2
           playwright install --with-deps chromium
 
-      - name: Post video to X
+      - name: Run scheduler
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           UPLOAD_FOLDER_ID:        ${{ secrets.UPLOAD_FOLDER_ID }}
@@ -50,4 +57,6 @@ jobs:
           CUSTOM_CAPTION:          ${{ github.event.inputs.custom_caption }}
           SHUFFLE_ORDER:           ${{ github.event.inputs.shuffle || 'false' }}
           POSTS_CSV_PATH:          table.csv
+          INTERVAL_MINUTES:        ${{ github.event.inputs.interval_minutes || '30' }}
+          MAX_POSTS:               ${{ github.event.inputs.max_posts || '0' }}
         run: python bulk_post_to_x.py
