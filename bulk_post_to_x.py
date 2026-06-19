@@ -3,6 +3,9 @@ Fetches a video from Google Drive (folder: UPLOAD_FOLDER_ID),
 posts it to X with a caption from table.csv, then moves the file
 to PROCESSED_FOLDER_ID to avoid re-posting.
 
+Runs in a loop, posting one video every INTERVAL_MINUTES (default: 30).
+The GitHub Actions workflow keeps it alive up to the job timeout.
+
 Required secrets / env vars:
     GOOGLE_CREDENTIALS_JSON   - full JSON with client_id, client_secret,
                                 refresh_token, token_uri (see README)
@@ -13,6 +16,8 @@ Required secrets / env vars:
     CAPTION_SOURCE            - "csv" or "custom" (default: csv)
     CUSTOM_CAPTION            - used when CAPTION_SOURCE=custom
     SHUFFLE_ORDER             - "true" to pick a random video (default: false)
+    INTERVAL_MINUTES          - minutes between posts (default: 30)
+    MAX_POSTS                 - max posts per run, 0 = unlimited (default: 0)
 """
 
 import csv
@@ -21,6 +26,7 @@ import os
 import random
 import socket
 import sys
+import time
 import uuid
 
 from google.oauth2.credentials import Credentials
@@ -39,6 +45,8 @@ CSV_PATH = os.environ.get("POSTS_CSV_PATH", "table.csv")
 CAPTION_SOURCE = os.environ.get("CAPTION_SOURCE", "csv").strip().lower()
 CUSTOM_CAPTION_RAW = os.environ.get("CUSTOM_CAPTION", "")
 SHUFFLE = os.environ.get("SHUFFLE_ORDER", "false").lower() == "true"
+INTERVAL_MINUTES = int(os.environ.get("INTERVAL_MINUTES", "30"))
+MAX_POSTS = int(os.environ.get("MAX_POSTS", "0"))  # 0 = unlimited
 
 
 # ── Google Drive helpers ─────────────────────────────────────────────────────
@@ -86,6 +94,11 @@ def release_claim(service, file_id, original_name):
 
 
 def fetch_video_from_drive():
+    """
+    Returns (file_meta_dict, local_path) or (None, None) if no videos left.
+    Unlike before, returns (None, None) instead of sys.exit() so the
+    scheduler loop can handle an empty queue gracefully.
+    """
     service = get_drive_service()
     folder_id = get_env("UPLOAD_FOLDER_ID")
 
@@ -98,7 +111,8 @@ def fetch_video_from_drive():
 
     files = results.get("files", [])
     if not files:
-        sys.exit("No files found in the upload folder.")
+        print("No files found in the upload folder.")
+        return None, None
 
     if SHUFFLE:
         random.shuffle(files)
@@ -129,7 +143,8 @@ def fetch_video_from_drive():
         file["_service"] = service
         return file, local_path
 
-    sys.exit("No unclaimed video files found in the upload folder.")
+    print("No unclaimed video files found in the upload folder.")
+    return None, None
 
 
 def move_to_processed(service, file_id, original_name):
@@ -169,7 +184,6 @@ def build_text_custom(raw):
 # ── Playwright helpers ───────────────────────────────────────────────────────
 
 def wait_for_mask_gone(page, timeout=20000):
-    """Wait for X's #layers mask overlay to disappear."""
     try:
         page.wait_for_selector(
             '[data-testid="mask"]', state="hidden", timeout=timeout
@@ -189,10 +203,6 @@ def wait_for_mask_gone(page, timeout=20000):
 
 
 def js_focus_and_type(page, text):
-    """
-    Focus the tweet textarea via JS then type using Playwright keyboard.
-    Bypasses pointer-event overlays entirely.
-    """
     page.evaluate("""
         () => {
             const el = document.querySelector('[data-testid="tweetTextarea_0"]');
@@ -214,10 +224,6 @@ def js_focus_and_type(page, text):
 # ── X / Playwright posting ───────────────────────────────────────────────────
 
 def post_video_to_x(local_path, caption_text):
-    """
-    Open X compose, attach the video file, fill caption, and submit.
-    Uses a saved Playwright storage state for authentication.
-    """
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -234,7 +240,7 @@ def post_video_to_x(local_path, caption_text):
         )
         page = context.new_page()
 
-        # ── 1. Navigate to home first, then open compose ──────────────────
+        # ── 1. Load home first ────────────────────────────────────────────
         print("Loading X home…")
         page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
 
@@ -245,30 +251,25 @@ def post_video_to_x(local_path, caption_text):
             )
 
         page.wait_for_timeout(3000)
-
-        # ── 2. Wait for mask/overlay to clear on home page ────────────────
         wait_for_mask_gone(page, timeout=15000)
 
-        # ── 3. Navigate to compose ────────────────────────────────────────
+        # ── 2. Open compose ───────────────────────────────────────────────
         print("Navigating to compose…")
         page.goto("https://x.com/compose/post", wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(3000)
-
         wait_for_mask_gone(page, timeout=20000)
 
-        # ── 4. Focus textbox and type caption via JS + keyboard ───────────
+        # ── 3. Type caption ───────────────────────────────────────────────
         print("Locating textbox…")
         page.wait_for_selector(
             '[data-testid="tweetTextarea_0"]', state="attached", timeout=15000
         )
         page.wait_for_timeout(1000)
-
         js_focus_and_type(page, caption_text)
         print(f"Caption typed ({len(caption_text)} chars).")
-
         page.wait_for_timeout(500)
 
-        # ── 5. Attach video ───────────────────────────────────────────────
+        # ── 4. Attach video ───────────────────────────────────────────────
         print("Attaching video…")
         file_input = page.locator('input[data-testid="fileInput"]').first
         try:
@@ -290,7 +291,7 @@ def post_video_to_x(local_path, caption_text):
         file_input.set_input_files(local_path)
         print("Video attached. Waiting for upload to complete…")
 
-        # ── 6. Wait for upload to finish ──────────────────────────────────
+        # ── 5. Wait for upload ────────────────────────────────────────────
         try:
             page.wait_for_selector(
                 '[data-testid="progressBar"]', state="visible", timeout=20000
@@ -301,17 +302,13 @@ def post_video_to_x(local_path, caption_text):
             )
             print("Upload complete (progress bar gone).")
         except PWTimeout:
-            print("Warning: progress bar not detected or upload timed out; continuing.")
+            print("Warning: progress bar not detected or timed out; continuing.")
 
-        # Extra buffer for X's server-side processing
         page.wait_for_timeout(5000)
-
-        # Wait for mask to clear again after upload
         wait_for_mask_gone(page, timeout=15000)
 
-        # ── 7. Click post button via JS arrow function ─────────────────────
+        # ── 6. Submit post ────────────────────────────────────────────────
         print("Submitting post…")
-
         try:
             page.wait_for_selector(
                 '[data-testid="tweetButton"]:not([aria-disabled="true"])',
@@ -319,7 +316,7 @@ def post_video_to_x(local_path, caption_text):
                 timeout=15000,
             )
         except PWTimeout:
-            print("Warning: tweetButton disabled state check timed out; trying anyway.")
+            print("Warning: tweetButton disabled check timed out; trying anyway.")
 
         page.wait_for_timeout(1000)
 
@@ -339,22 +336,22 @@ def post_video_to_x(local_path, caption_text):
 
         print("Post button clicked.")
 
-        # ── 8. Confirm post was submitted ─────────────────────────────────
+        # ── 7. Confirm submission ─────────────────────────────────────────
         try:
             page.wait_for_url(
                 lambda url: "/home" in url or "/compose" not in url,
                 timeout=20000,
             )
-            print("Post submitted successfully — page navigated away from compose.")
+            print("Post submitted successfully — navigated away from compose.")
         except PWTimeout:
-            print("No navigation detected; checking for compose dialog closure…")
+            print("No navigation detected; checking for compose closure…")
             try:
                 page.wait_for_selector(
                     '[data-testid="tweetTextarea_0"]', state="detached", timeout=5000
                 )
                 print("Compose textarea gone — post likely submitted.")
             except PWTimeout:
-                print("Warning: could not confirm post submission. Manual check advised.")
+                print("Warning: could not confirm submission. Manual check advised.")
 
         page.wait_for_timeout(3000)
         browser.close()
@@ -362,21 +359,21 @@ def post_video_to_x(local_path, caption_text):
     print("Posted to X successfully.")
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Single post cycle ────────────────────────────────────────────────────────
 
-def main():
-    # Write X session state from secret
-    state_json = get_env("X_STORAGE_STATE_JSON")
-    with open(STORAGE_STATE_PATH, "w") as f:
-        f.write(state_json)
-
-    # Fetch video from Drive
+def run_one_post():
+    """
+    Fetch one video, build caption, post it, move to processed.
+    Returns True if a post was made, False if no videos were available.
+    """
     file_meta, local_path = fetch_video_from_drive()
+    if file_meta is None:
+        return False
+
     service = file_meta["_service"]
     original_name = file_meta["original_name"]
     file_id = file_meta["id"]
 
-    # Build caption
     if CAPTION_SOURCE == "custom":
         if not CUSTOM_CAPTION_RAW.strip():
             release_claim(service, file_id, original_name)
@@ -389,7 +386,6 @@ def main():
     print(f"\nCaption:\n{caption}\n")
     print(f"Video: {local_path}\n")
 
-    # Post to X
     try:
         post_video_to_x(local_path, caption)
     except Exception as e:
@@ -397,16 +393,70 @@ def main():
         release_claim(service, file_id, original_name)
         raise
 
-    # Move to processed folder
     move_to_processed(service, file_id, original_name)
 
-    # Clean up local temp file
     try:
         os.remove(local_path)
     except OSError:
         pass
 
-    print("Done.")
+    return True
+
+
+# ── Scheduler loop ───────────────────────────────────────────────────────────
+
+def sleep_with_countdown(seconds):
+    """Sleep for `seconds`, printing a countdown every 60s."""
+    interval = 60
+    remaining = seconds
+    while remaining > 0:
+        chunk = min(interval, remaining)
+        mins = remaining // 60
+        print(f"  Next post in ~{mins} minute(s)… (sleeping {chunk}s)")
+        time.sleep(chunk)
+        remaining -= chunk
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    # Write X session state from secret
+    state_json = get_env("X_STORAGE_STATE_JSON")
+    with open(STORAGE_STATE_PATH, "w") as f:
+        f.write(state_json)
+
+    interval_seconds = INTERVAL_MINUTES * 60
+    post_count = 0
+
+    print(f"Scheduler started — posting every {INTERVAL_MINUTES} minute(s).")
+    if MAX_POSTS:
+        print(f"Will stop after {MAX_POSTS} post(s).")
+    else:
+        print("Running until no videos remain or job timeout is reached.")
+
+    while True:
+        print(f"\n{'='*50}")
+        print(f"Post #{post_count + 1} starting at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
+        print(f"{'='*50}")
+
+        posted = run_one_post()
+
+        if not posted:
+            print("No videos left in upload folder. Exiting scheduler.")
+            break
+
+        post_count += 1
+        print(f"Post #{post_count} done.")
+
+        if MAX_POSTS and post_count >= MAX_POSTS:
+            print(f"Reached MAX_POSTS={MAX_POSTS}. Exiting scheduler.")
+            break
+
+        # Sleep until next post
+        print(f"\nSleeping {INTERVAL_MINUTES} minute(s) before next post…")
+        sleep_with_countdown(interval_seconds)
+
+    print(f"\nScheduler finished. Total posts made: {post_count}")
 
 
 if __name__ == "__main__":
