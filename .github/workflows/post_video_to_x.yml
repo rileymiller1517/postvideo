@@ -18,10 +18,6 @@ on:
         description: "Pick a random video instead of oldest first? (true/false)"
         required: false
         default: "false"
-  schedule:
-    # Optional: run automatically on a schedule (e.g. every 6 hours)
-    # Uncomment and adjust as needed:
-    # - cron: "0 */6 * * *"
 
 jobs:
   post-video:
@@ -42,23 +38,16 @@ jobs:
             google-api-python-client \
             google-auth \
             google-auth-httplib2
-
           playwright install --with-deps chromium
 
       - name: Post video to X
         env:
-          # ── Google Drive ──────────────────────────────────────────────────
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           UPLOAD_FOLDER_ID:        ${{ secrets.UPLOAD_FOLDER_ID }}
           PROCESSED_FOLDER_ID:     ${{ secrets.PROCESSED_FOLDER_ID }}
-
-          # ── X session ────────────────────────────────────────────────────
           X_STORAGE_STATE_JSON:    ${{ secrets.X_STORAGE_STATE_JSON }}
-
-          # ── Caption config ───────────────────────────────────────────────
-          CAPTION_SOURCE:   ${{ github.event.inputs.caption_source || 'csv' }}
-          CUSTOM_CAPTION:   ${{ github.event.inputs.custom_caption }}
-          SHUFFLE_ORDER:    ${{ github.event.inputs.shuffle || 'false' }}
-          POSTS_CSV_PATH:   table.csv
-
+          CAPTION_SOURCE:          ${{ github.event.inputs.caption_source || 'csv' }}
+          CUSTOM_CAPTION:          ${{ github.event.inputs.custom_caption }}
+          SHUFFLE_ORDER:           ${{ github.event.inputs.shuffle || 'false' }}
+          POSTS_CSV_PATH:          table.csv
         run: python bulk_post_to_x.py
