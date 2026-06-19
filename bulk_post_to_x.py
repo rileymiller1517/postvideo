@@ -3,10 +3,6 @@ Fetches a video from Google Drive (folder: UPLOAD_FOLDER_ID),
 posts it to X with a caption from table.csv, then moves the file
 to PROCESSED_FOLDER_ID to avoid re-posting.
 
-Google credentials are stored as a GitHub secret (GOOGLE_CREDENTIALS_JSON)
-instead of token.pickle. A refresh token is embedded in the same JSON so
-no browser interaction is needed at runtime.
-
 Required secrets / env vars:
     GOOGLE_CREDENTIALS_JSON   - full JSON with client_id, client_secret,
                                 refresh_token, token_uri (see README)
@@ -25,7 +21,6 @@ import os
 import random
 import socket
 import sys
-import time
 import uuid
 
 from google.oauth2.credentials import Credentials
@@ -58,34 +53,21 @@ def get_env(name, required=True):
 
 
 def get_drive_service():
-    """
-    Build a Drive service from GOOGLE_CREDENTIALS_JSON secret.
-
-    The JSON must contain:
-        client_id, client_secret, refresh_token, token_uri
-
-    Generate it once locally with generate_token.py (see README), then store
-    the printed JSON as the GOOGLE_CREDENTIALS_JSON GitHub secret.
-    """
     raw = get_env("GOOGLE_CREDENTIALS_JSON")
     info = json.loads(raw)
-
     creds = Credentials(
-        token=info.get("access_token"),          # may be None / expired
+        token=info.get("access_token"),
         refresh_token=info["refresh_token"],
         token_uri=info.get("token_uri", "https://oauth2.googleapis.com/token"),
         client_id=info["client_id"],
         client_secret=info["client_secret"],
         scopes=["https://www.googleapis.com/auth/drive"],
     )
-
-    # Refresh unconditionally so we always have a valid access token.
     creds.refresh(Request())
     return build("drive", "v3", credentials=creds)
 
 
 def claim_file(service, file_id, current_name):
-    """Atomically claim a file by renaming it; returns claimed name or None."""
     claimed_name = f"{CLAIM_PREFIX}{RUN_TAG}__{current_name}"
     service.files().update(fileId=file_id, body={"name": claimed_name}).execute()
     check = service.files().get(fileId=file_id, fields="id,name").execute()
@@ -96,7 +78,6 @@ def claim_file(service, file_id, current_name):
 
 
 def release_claim(service, file_id, original_name):
-    """Rename file back to original if posting failed after claiming."""
     try:
         service.files().update(fileId=file_id, body={"name": original_name}).execute()
         print(f"Released claim on '{original_name}'.")
@@ -105,16 +86,12 @@ def release_claim(service, file_id, original_name):
 
 
 def fetch_video_from_drive():
-    """
-    List videos in UPLOAD_FOLDER_ID, claim one, download it to /tmp.
-    Returns (file_meta_dict, local_path) or (None, None).
-    """
     service = get_drive_service()
     folder_id = get_env("UPLOAD_FOLDER_ID")
 
     results = service.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
-        orderBy="createdTime asc",          # oldest first = FIFO queue
+        orderBy="createdTime asc",
         pageSize=20,
         fields="files(id,name,mimeType)",
     ).execute()
@@ -149,21 +126,20 @@ def fetch_video_from_drive():
 
         file["original_name"] = name
         file["claimed_name"] = claimed
-        file["_service"] = service          # reuse authenticated client
+        file["_service"] = service
         return file, local_path
 
     sys.exit("No unclaimed video files found in the upload folder.")
 
 
 def move_to_processed(service, file_id, original_name):
-    """Move file from UPLOAD_FOLDER_ID to PROCESSED_FOLDER_ID."""
     upload_id = get_env("UPLOAD_FOLDER_ID")
     processed_id = get_env("PROCESSED_FOLDER_ID")
     service.files().update(
         fileId=file_id,
         addParents=processed_id,
         removeParents=upload_id,
-        body={"name": original_name},       # restore clean name
+        body={"name": original_name},
     ).execute()
     print(f"Moved '{original_name}' to processed folder.")
 
@@ -190,6 +166,49 @@ def build_text_custom(raw):
     return raw.replace("\\n", "\n").strip()
 
 
+# ── Playwright helpers ───────────────────────────────────────────────────────
+
+def wait_for_mask_gone(page, timeout=20000):
+    """Wait for X's #layers mask overlay to disappear."""
+    try:
+        page.wait_for_selector(
+            '[data-testid="mask"]', state="hidden", timeout=timeout
+        )
+        print("Mask overlay gone.")
+    except PWTimeout:
+        print("Mask still present — force-removing via JS.")
+        page.evaluate("""
+            const mask = document.querySelector('[data-testid="mask"]');
+            if (mask) mask.remove();
+            const layers = document.getElementById('layers');
+            if (layers) layers.style.pointerEvents = 'none';
+        """)
+        page.wait_for_timeout(500)
+
+
+def js_focus_and_type(page, selector_js, text):
+    """
+    Focus a contenteditable element via JS and dispatch keyboard events.
+    More reliable than Playwright .click() + .type() when overlays are present.
+    """
+    # Set focus via JS
+    page.evaluate(f"""
+        const el = {selector_js};
+        if (el) {{
+            el.focus();
+            el.click();
+        }}
+    """)
+    page.wait_for_timeout(500)
+
+    # Type character by character using Playwright keyboard (element is now focused)
+    for char in text:
+        if char == "\n":
+            page.keyboard.press("Enter")
+        else:
+            page.keyboard.type(char, delay=20)
+
+
 # ── X / Playwright posting ───────────────────────────────────────────────────
 
 def post_video_to_x(local_path, caption_text):
@@ -198,7 +217,10 @@ def post_video_to_x(local_path, caption_text):
     Uses a saved Playwright storage state for authentication.
     """
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         context = browser.new_context(
             storage_state=STORAGE_STATE_PATH,
             viewport={"width": 1280, "height": 900},
@@ -210,7 +232,11 @@ def post_video_to_x(local_path, caption_text):
         )
         page = context.new_page()
 
-        page.goto("https://x.com/compose/post", wait_until="domcontentloaded")
+        # ── 1. Navigate to home first, then open compose ──────────────────
+        # Going directly to /compose/post sometimes loads with a broken layer
+        # stack. Landing on home first then navigating is more stable.
+        print("Loading X home…")
+        page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
 
         if "login" in page.url:
             sys.exit(
@@ -218,64 +244,125 @@ def post_video_to_x(local_path, caption_text):
                 "Re-run your session capture script and refresh X_STORAGE_STATE_JSON."
             )
 
-        # Fill caption text — scope to primaryColumn to avoid strict-mode
-        # violation when X renders a second textarea in a modal/sidebar
-        primary = page.get_by_test_id("primaryColumn")
-        textbox = primary.get_by_test_id("tweetTextarea_0")
-        textbox.wait_for(state="visible", timeout=15000)
-        textbox.click()
-        # Use type() instead of fill() — contenteditable divs ignore fill()
-        textbox.type(caption_text, delay=30)
+        # Wait for the page to be interactive
+        page.wait_for_timeout(3000)
 
-        # Attach video via the hidden file input
+        # ── 2. Wait for mask/overlay to clear on home page ────────────────
+        wait_for_mask_gone(page, timeout=15000)
+
+        # ── 3. Navigate to compose ────────────────────────────────────────
+        print("Navigating to compose…")
+        page.goto("https://x.com/compose/post", wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(3000)
+
+        # Wait for mask on compose page too
+        wait_for_mask_gone(page, timeout=20000)
+
+        # ── 4. Find and focus the textbox via JS (bypasses pointer blocks) ─
+        print("Locating textbox…")
+        # Wait for the textarea to exist in DOM
+        page.wait_for_selector(
+            '[data-testid="tweetTextarea_0"]', state="attached", timeout=15000
+        )
+        page.wait_for_timeout(1000)
+
+        # Use JS to focus — avoids pointer-event overlay issues entirely
+        js_focus_and_type(
+            page,
+            "document.querySelector('[data-testid=\"tweetTextarea_0\"]')",
+            caption_text,
+        )
+        print(f"Caption typed ({len(caption_text)} chars).")
+
+        # Verify text landed
+        page.wait_for_timeout(500)
+
+        # ── 5. Attach video ───────────────────────────────────────────────
+        print("Attaching video…")
         file_input = page.locator('input[data-testid="fileInput"]').first
         try:
             file_input.wait_for(state="attached", timeout=8000)
         except PWTimeout:
-            page.get_by_test_id("attachments").click()
-            file_input = page.locator('input[type="file"]').first
-            file_input.wait_for(state="attached", timeout=8000)
+            # Fallback: click media attach button to reveal input
+            try:
+                page.evaluate("""
+                    const btn = document.querySelector('[data-testid="attachments"]');
+                    if (btn) btn.click();
+                """)
+                page.wait_for_timeout(1000)
+                file_input = page.locator('input[type="file"]').first
+                file_input.wait_for(state="attached", timeout=8000)
+            except PWTimeout:
+                sys.exit("Could not find file input for video attachment.")
 
         file_input.set_input_files(local_path)
         print("Video attached. Waiting for upload to complete…")
 
-        # Wait for upload progress bar to appear then disappear
+        # ── 6. Wait for upload to finish ──────────────────────────────────
+        # Wait for progress bar to appear (confirms upload started)
         try:
             page.wait_for_selector(
-                '[data-testid="progressBar"]', state="visible", timeout=15000
+                '[data-testid="progressBar"]', state="visible", timeout=20000
             )
+            print("Upload started (progress bar visible).")
+            # Now wait for it to go away (upload complete)
             page.wait_for_selector(
-                '[data-testid="progressBar"]', state="detached", timeout=180000
+                '[data-testid="progressBar"]', state="detached", timeout=300000
             )
+            print("Upload complete (progress bar gone).")
         except PWTimeout:
-            print("Warning: upload progress bar not detected or timed out; continuing.")
+            print("Warning: progress bar not detected or upload timed out; continuing.")
 
-        # Wait for the intercepting overlay to clear
-        try:
-            page.wait_for_selector(
-                'div[class*="r-1p0dtai"][class*="r-1d2f490"]',
-                state="detached",
-                timeout=30000,
-            )
-            print("Overlay cleared.")
-        except PWTimeout:
-            print("Warning: overlay still present; attempting JS click to bypass.")
-
-        # Additional buffer for X's internal video processing
+        # Extra buffer for X's server-side processing
         page.wait_for_timeout(5000)
 
-        # Submit using JS click to bypass any residual pointer-event overlay
-        post_button = page.get_by_test_id("tweetButton")
-        post_button.wait_for(state="visible", timeout=15000)
-        post_button.evaluate("el => el.click()")
+        # Wait for mask to clear again after upload
+        wait_for_mask_gone(page, timeout=15000)
+
+        # ── 7. Click post button via JS ───────────────────────────────────
+        print("Submitting post…")
+
+        # Wait for tweetButton to exist and not be disabled
+        page.wait_for_selector(
+            '[data-testid="tweetButton"]:not([aria-disabled="true"])',
+            state="attached",
+            timeout=15000,
+        )
+        page.wait_for_timeout(1000)
+
+        # JS click bypasses any residual overlay
+        clicked = page.evaluate("""
+            const btn = document.querySelector('[data-testid="tweetButton"]');
+            if (btn) {
+                btn.click();
+                return true;
+            }
+            return false;
+        """)
+
+        if not clicked:
+            sys.exit("Post button not found in DOM.")
+
         print("Post button clicked.")
 
-        # Wait for navigation or confirmation that post was submitted
+        # ── 8. Confirm post was submitted ─────────────────────────────────
         try:
-            page.wait_for_url("**/home", timeout=15000)
-            print("Redirected to home — post confirmed.")
+            # X redirects to home or closes compose after a successful post
+            page.wait_for_url(
+                lambda url: "/home" in url or "/compose" not in url,
+                timeout=20000,
+            )
+            print("Post submitted successfully — page navigated away from compose.")
         except PWTimeout:
-            print("No redirect detected; post may still have succeeded.")
+            # Not always a failure — X sometimes stays on compose
+            print("No navigation detected; checking for compose dialog closure…")
+            try:
+                page.wait_for_selector(
+                    '[data-testid="tweetTextarea_0"]', state="detached", timeout=5000
+                )
+                print("Compose textarea gone — post likely submitted.")
+            except PWTimeout:
+                print("Warning: could not confirm post submission. Manual check advised.")
 
         page.wait_for_timeout(3000)
         browser.close()
