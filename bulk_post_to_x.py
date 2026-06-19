@@ -218,11 +218,14 @@ def post_video_to_x(local_path, caption_text):
                 "Re-run your session capture script and refresh X_STORAGE_STATE_JSON."
             )
 
-        # Fill caption text
-        textbox = page.get_by_test_id("tweetTextarea_0")
+        # Fill caption text — scope to primaryColumn to avoid strict-mode
+        # violation when X renders a second textarea in a modal/sidebar
+        primary = page.get_by_test_id("primaryColumn")
+        textbox = primary.get_by_test_id("tweetTextarea_0")
         textbox.wait_for(state="visible", timeout=15000)
         textbox.click()
-        textbox.fill(caption_text)
+        # Use type() instead of fill() — contenteditable divs ignore fill()
+        textbox.type(caption_text, delay=30)
 
         # Attach video via the hidden file input
         file_input = page.locator('input[data-testid="fileInput"]').first
