@@ -178,30 +178,32 @@ def wait_for_mask_gone(page, timeout=20000):
     except PWTimeout:
         print("Mask still present — force-removing via JS.")
         page.evaluate("""
-            const mask = document.querySelector('[data-testid="mask"]');
-            if (mask) mask.remove();
-            const layers = document.getElementById('layers');
-            if (layers) layers.style.pointerEvents = 'none';
+            () => {
+                const mask = document.querySelector('[data-testid="mask"]');
+                if (mask) mask.remove();
+                const layers = document.getElementById('layers');
+                if (layers) layers.style.pointerEvents = 'none';
+            }
         """)
         page.wait_for_timeout(500)
 
 
-def js_focus_and_type(page, selector_js, text):
+def js_focus_and_type(page, text):
     """
-    Focus a contenteditable element via JS and dispatch keyboard events.
-    More reliable than Playwright .click() + .type() when overlays are present.
+    Focus the tweet textarea via JS then type using Playwright keyboard.
+    Bypasses pointer-event overlays entirely.
     """
-    # Set focus via JS
-    page.evaluate(f"""
-        const el = {selector_js};
-        if (el) {{
-            el.focus();
-            el.click();
-        }}
+    page.evaluate("""
+        () => {
+            const el = document.querySelector('[data-testid="tweetTextarea_0"]');
+            if (el) {
+                el.focus();
+                el.click();
+            }
+        }
     """)
     page.wait_for_timeout(500)
 
-    # Type character by character using Playwright keyboard (element is now focused)
     for char in text:
         if char == "\n":
             page.keyboard.press("Enter")
@@ -233,8 +235,6 @@ def post_video_to_x(local_path, caption_text):
         page = context.new_page()
 
         # ── 1. Navigate to home first, then open compose ──────────────────
-        # Going directly to /compose/post sometimes loads with a broken layer
-        # stack. Landing on home first then navigating is more stable.
         print("Loading X home…")
         page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
 
@@ -244,7 +244,6 @@ def post_video_to_x(local_path, caption_text):
                 "Re-run your session capture script and refresh X_STORAGE_STATE_JSON."
             )
 
-        # Wait for the page to be interactive
         page.wait_for_timeout(3000)
 
         # ── 2. Wait for mask/overlay to clear on home page ────────────────
@@ -255,26 +254,18 @@ def post_video_to_x(local_path, caption_text):
         page.goto("https://x.com/compose/post", wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(3000)
 
-        # Wait for mask on compose page too
         wait_for_mask_gone(page, timeout=20000)
 
-        # ── 4. Find and focus the textbox via JS (bypasses pointer blocks) ─
+        # ── 4. Focus textbox and type caption via JS + keyboard ───────────
         print("Locating textbox…")
-        # Wait for the textarea to exist in DOM
         page.wait_for_selector(
             '[data-testid="tweetTextarea_0"]', state="attached", timeout=15000
         )
         page.wait_for_timeout(1000)
 
-        # Use JS to focus — avoids pointer-event overlay issues entirely
-        js_focus_and_type(
-            page,
-            "document.querySelector('[data-testid=\"tweetTextarea_0\"]')",
-            caption_text,
-        )
+        js_focus_and_type(page, caption_text)
         print(f"Caption typed ({len(caption_text)} chars).")
 
-        # Verify text landed
         page.wait_for_timeout(500)
 
         # ── 5. Attach video ───────────────────────────────────────────────
@@ -283,11 +274,12 @@ def post_video_to_x(local_path, caption_text):
         try:
             file_input.wait_for(state="attached", timeout=8000)
         except PWTimeout:
-            # Fallback: click media attach button to reveal input
             try:
                 page.evaluate("""
-                    const btn = document.querySelector('[data-testid="attachments"]');
-                    if (btn) btn.click();
+                    () => {
+                        const btn = document.querySelector('[data-testid="attachments"]');
+                        if (btn) btn.click();
+                    }
                 """)
                 page.wait_for_timeout(1000)
                 file_input = page.locator('input[type="file"]').first
@@ -299,13 +291,11 @@ def post_video_to_x(local_path, caption_text):
         print("Video attached. Waiting for upload to complete…")
 
         # ── 6. Wait for upload to finish ──────────────────────────────────
-        # Wait for progress bar to appear (confirms upload started)
         try:
             page.wait_for_selector(
                 '[data-testid="progressBar"]', state="visible", timeout=20000
             )
             print("Upload started (progress bar visible).")
-            # Now wait for it to go away (upload complete)
             page.wait_for_selector(
                 '[data-testid="progressBar"]', state="detached", timeout=300000
             )
@@ -319,25 +309,29 @@ def post_video_to_x(local_path, caption_text):
         # Wait for mask to clear again after upload
         wait_for_mask_gone(page, timeout=15000)
 
-        # ── 7. Click post button via JS ───────────────────────────────────
+        # ── 7. Click post button via JS arrow function ─────────────────────
         print("Submitting post…")
 
-        # Wait for tweetButton to exist and not be disabled
-        page.wait_for_selector(
-            '[data-testid="tweetButton"]:not([aria-disabled="true"])',
-            state="attached",
-            timeout=15000,
-        )
+        try:
+            page.wait_for_selector(
+                '[data-testid="tweetButton"]:not([aria-disabled="true"])',
+                state="attached",
+                timeout=15000,
+            )
+        except PWTimeout:
+            print("Warning: tweetButton disabled state check timed out; trying anyway.")
+
         page.wait_for_timeout(1000)
 
-        # JS click bypasses any residual overlay
         clicked = page.evaluate("""
-            const btn = document.querySelector('[data-testid="tweetButton"]');
-            if (btn) {
-                btn.click();
-                return true;
+            () => {
+                const btn = document.querySelector('[data-testid="tweetButton"]');
+                if (btn) {
+                    btn.click();
+                    return true;
+                }
+                return false;
             }
-            return false;
         """)
 
         if not clicked:
@@ -347,14 +341,12 @@ def post_video_to_x(local_path, caption_text):
 
         # ── 8. Confirm post was submitted ─────────────────────────────────
         try:
-            # X redirects to home or closes compose after a successful post
             page.wait_for_url(
                 lambda url: "/home" in url or "/compose" not in url,
                 timeout=20000,
             )
             print("Post submitted successfully — page navigated away from compose.")
         except PWTimeout:
-            # Not always a failure — X sometimes stays on compose
             print("No navigation detected; checking for compose dialog closure…")
             try:
                 page.wait_for_selector(
