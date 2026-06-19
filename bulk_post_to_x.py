@@ -201,7 +201,6 @@ def post_video_to_x(local_path, caption_text):
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             storage_state=STORAGE_STATE_PATH,
-            # Desktop viewport — X's video upload button is easier to target
             viewport={"width": 1280, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) "
@@ -227,11 +226,9 @@ def post_video_to_x(local_path, caption_text):
 
         # Attach video via the hidden file input
         file_input = page.locator('input[data-testid="fileInput"]').first
-        # If not found, X may render it differently — wait a moment
         try:
             file_input.wait_for(state="attached", timeout=8000)
         except PWTimeout:
-            # Fallback: click the media button to reveal the input
             page.get_by_test_id("attachments").click()
             file_input = page.locator('input[type="file"]').first
             file_input.wait_for(state="attached", timeout=8000)
@@ -239,24 +236,47 @@ def post_video_to_x(local_path, caption_text):
         file_input.set_input_files(local_path)
         print("Video attached. Waiting for upload to complete…")
 
-        # Wait for upload progress to disappear (X shows a progress bar)
+        # Wait for upload progress bar to appear then disappear
         try:
             page.wait_for_selector(
-                '[data-testid="progressBar"]', state="detached", timeout=120000
+                '[data-testid="progressBar"]', state="visible", timeout=15000
+            )
+            page.wait_for_selector(
+                '[data-testid="progressBar"]', state="detached", timeout=180000
             )
         except PWTimeout:
-            print("Warning: upload progress bar timeout; posting anyway.")
+            print("Warning: upload progress bar not detected or timed out; continuing.")
 
-        # Small extra wait to let X process the video
-        page.wait_for_timeout(3000)
+        # Wait for the intercepting overlay to clear
+        try:
+            page.wait_for_selector(
+                'div[class*="r-1p0dtai"][class*="r-1d2f490"]',
+                state="detached",
+                timeout=30000,
+            )
+            print("Overlay cleared.")
+        except PWTimeout:
+            print("Warning: overlay still present; attempting JS click to bypass.")
 
-        # Submit
-        post_button = page.get_by_test_id("tweetButton")
-        post_button.wait_for(state="visible", timeout=10000)
-        post_button.click()
+        # Additional buffer for X's internal video processing
         page.wait_for_timeout(5000)
 
+        # Submit using JS click to bypass any residual pointer-event overlay
+        post_button = page.get_by_test_id("tweetButton")
+        post_button.wait_for(state="visible", timeout=15000)
+        post_button.evaluate("el => el.click()")
+        print("Post button clicked.")
+
+        # Wait for navigation or confirmation that post was submitted
+        try:
+            page.wait_for_url("**/home", timeout=15000)
+            print("Redirected to home — post confirmed.")
+        except PWTimeout:
+            print("No redirect detected; post may still have succeeded.")
+
+        page.wait_for_timeout(3000)
         browser.close()
+
     print("Posted to X successfully.")
 
 
