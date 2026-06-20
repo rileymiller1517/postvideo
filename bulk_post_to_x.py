@@ -4,7 +4,6 @@ posts it to X with a caption from table.csv, then moves the file
 to PROCESSED_FOLDER_ID to avoid re-posting.
 
 Runs in a loop, posting one video every INTERVAL_MINUTES (default: 30).
-The GitHub Actions workflow keeps it alive up to the job timeout.
 
 Required secrets / env vars:
     GOOGLE_CREDENTIALS_JSON   - full JSON with client_id, client_secret,
@@ -47,6 +46,10 @@ CUSTOM_CAPTION_RAW = os.environ.get("CUSTOM_CAPTION", "")
 SHUFFLE = os.environ.get("SHUFFLE_ORDER", "false").lower() == "true"
 INTERVAL_MINUTES = int(os.environ.get("INTERVAL_MINUTES", "30"))
 MAX_POSTS = int(os.environ.get("MAX_POSTS", "0"))  # 0 = unlimited
+
+# ── Retry config ─────────────────────────────────────────────────────────────
+MAX_RETRIES = 3          # retries per post attempt
+RETRY_WAIT_SEC = 30      # wait between retries
 
 
 # ── Google Drive helpers ─────────────────────────────────────────────────────
@@ -96,8 +99,6 @@ def release_claim(service, file_id, original_name):
 def fetch_video_from_drive():
     """
     Returns (file_meta_dict, local_path) or (None, None) if no videos left.
-    Unlike before, returns (None, None) instead of sys.exit() so the
-    scheduler loop can handle an empty queue gracefully.
     """
     service = get_drive_service()
     folder_id = get_env("UPLOAD_FOLDER_ID")
@@ -183,7 +184,18 @@ def build_text_custom(raw):
 
 # ── Playwright helpers ───────────────────────────────────────────────────────
 
-def wait_for_mask_gone(page, timeout=20000):
+def save_debug_screenshot(page, label="debug"):
+    """Save a screenshot to help diagnose failures."""
+    try:
+        path = f"/tmp/screenshot_{label}_{int(time.time())}.png"
+        page.screenshot(path=path)
+        print(f"Debug screenshot saved: {path}")
+    except Exception as e:
+        print(f"Could not save screenshot: {e}")
+
+
+def wait_for_mask_gone(page, timeout=30000):
+    """Wait for X's #layers mask overlay to disappear."""
     try:
         page.wait_for_selector(
             '[data-testid="mask"]', state="hidden", timeout=timeout
@@ -199,10 +211,64 @@ def wait_for_mask_gone(page, timeout=20000):
                 if (layers) layers.style.pointerEvents = 'none';
             }
         """)
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(1000)
+
+
+def wait_for_page_idle(page, idle_ms=2000, timeout=30000):
+    """
+    Wait until no network requests have fired for idle_ms.
+    Falls back gracefully on timeout.
+    """
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except PWTimeout:
+        pass  # Not critical — page may keep polling
+
+
+def navigate_to_compose(page):
+    """
+    Reliably navigate to compose page and wait for textarea to be ready.
+    Retries navigation up to 3 times if textarea doesn't appear.
+    """
+    for attempt in range(1, 4):
+        print(f"Navigating to compose (attempt {attempt})…")
+
+        # Always go via home first to reset state
+        page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45000)
+        wait_for_page_idle(page, timeout=15000)
+        page.wait_for_timeout(3000)
+        wait_for_mask_gone(page, timeout=20000)
+
+        # Now navigate to compose
+        page.goto("https://x.com/compose/post", wait_until="domcontentloaded", timeout=45000)
+        wait_for_page_idle(page, timeout=15000)
+        page.wait_for_timeout(4000)
+        wait_for_mask_gone(page, timeout=20000)
+
+        # Check textarea appeared
+        try:
+            page.wait_for_selector(
+                '[data-testid="tweetTextarea_0"]',
+                state="attached",
+                timeout=20000,
+            )
+            print("Compose textarea ready.")
+            return True
+        except PWTimeout:
+            save_debug_screenshot(page, f"compose_fail_attempt{attempt}")
+            print(f"Textarea not found on attempt {attempt}.")
+            if attempt < 3:
+                page.wait_for_timeout(5000)
+
+    return False
 
 
 def js_focus_and_type(page, text):
+    """
+    Focus the tweet textarea via JS then type using Playwright keyboard.
+    Bypasses pointer-event overlays entirely.
+    """
+    # Focus via JS
     page.evaluate("""
         () => {
             const el = document.querySelector('[data-testid="tweetTextarea_0"]');
@@ -212,22 +278,61 @@ def js_focus_and_type(page, text):
             }
         }
     """)
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(800)
 
+    # Clear anything already in the box
+    page.keyboard.press("Control+a")
+    page.wait_for_timeout(200)
+
+    # Type character by character
     for char in text:
         if char == "\n":
             page.keyboard.press("Enter")
         else:
-            page.keyboard.type(char, delay=20)
+            page.keyboard.type(char, delay=15)
+
+    page.wait_for_timeout(500)
+
+    # Verify text landed by checking box is non-empty
+    text_present = page.evaluate("""
+        () => {
+            const el = document.querySelector('[data-testid="tweetTextarea_0"]');
+            return el ? el.innerText.trim().length > 0 : false;
+        }
+    """)
+    if not text_present:
+        print("Warning: caption may not have landed in textbox — retrying type.")
+        page.evaluate("""
+            () => {
+                const el = document.querySelector('[data-testid="tweetTextarea_0"]');
+                if (el) { el.focus(); el.click(); }
+            }
+        """)
+        page.wait_for_timeout(500)
+        for char in text:
+            if char == "\n":
+                page.keyboard.press("Enter")
+            else:
+                page.keyboard.type(char, delay=25)
+        page.wait_for_timeout(500)
 
 
 # ── X / Playwright posting ───────────────────────────────────────────────────
 
 def post_video_to_x(local_path, caption_text):
+    """
+    Open X compose in a fresh browser, attach video, fill caption, submit.
+    A brand-new browser is launched for every post to avoid stale state.
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
         )
         context = browser.new_context(
             storage_state=STORAGE_STATE_PATH,
@@ -240,121 +345,142 @@ def post_video_to_x(local_path, caption_text):
         )
         page = context.new_page()
 
-        # ── 1. Load home first ────────────────────────────────────────────
-        print("Loading X home…")
-        page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
-
-        if "login" in page.url:
-            sys.exit(
-                "Session expired (redirected to login). "
-                "Re-run your session capture script and refresh X_STORAGE_STATE_JSON."
-            )
-
-        page.wait_for_timeout(3000)
-        wait_for_mask_gone(page, timeout=15000)
-
-        # ── 2. Open compose ───────────────────────────────────────────────
-        print("Navigating to compose…")
-        page.goto("https://x.com/compose/post", wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(3000)
-        wait_for_mask_gone(page, timeout=20000)
-
-        # ── 3. Type caption ───────────────────────────────────────────────
-        print("Locating textbox…")
-        page.wait_for_selector(
-            '[data-testid="tweetTextarea_0"]', state="attached", timeout=15000
-        )
-        page.wait_for_timeout(1000)
-        js_focus_and_type(page, caption_text)
-        print(f"Caption typed ({len(caption_text)} chars).")
-        page.wait_for_timeout(500)
-
-        # ── 4. Attach video ───────────────────────────────────────────────
-        print("Attaching video…")
-        file_input = page.locator('input[data-testid="fileInput"]').first
         try:
-            file_input.wait_for(state="attached", timeout=8000)
-        except PWTimeout:
+            # ── 1. Check session valid ────────────────────────────────────
+            print("Loading X home…")
+            page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45000)
+            wait_for_page_idle(page, timeout=15000)
+
+            if "login" in page.url:
+                sys.exit(
+                    "Session expired (redirected to login). "
+                    "Refresh X_STORAGE_STATE_JSON secret."
+                )
+
+            page.wait_for_timeout(3000)
+            wait_for_mask_gone(page, timeout=20000)
+
+            # ── 2. Navigate to compose (with retry) ───────────────────────
+            ready = navigate_to_compose(page)
+            if not ready:
+                save_debug_screenshot(page, "compose_not_ready")
+                raise RuntimeError("Could not load compose textarea after 3 attempts.")
+
+            page.wait_for_timeout(1000)
+
+            # ── 3. Type caption ───────────────────────────────────────────
+            print("Typing caption…")
+            js_focus_and_type(page, caption_text)
+            print(f"Caption typed ({len(caption_text)} chars).")
+
+            # ── 4. Attach video ───────────────────────────────────────────
+            print("Attaching video…")
+            file_input = page.locator('input[data-testid="fileInput"]').first
             try:
+                file_input.wait_for(state="attached", timeout=10000)
+            except PWTimeout:
+                # Fallback: click media button to reveal input
+                print("fileInput not found directly — clicking attachments button…")
                 page.evaluate("""
                     () => {
                         const btn = document.querySelector('[data-testid="attachments"]');
                         if (btn) btn.click();
                     }
                 """)
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(1500)
                 file_input = page.locator('input[type="file"]').first
-                file_input.wait_for(state="attached", timeout=8000)
-            except PWTimeout:
-                sys.exit("Could not find file input for video attachment.")
+                file_input.wait_for(state="attached", timeout=10000)
 
-        file_input.set_input_files(local_path)
-        print("Video attached. Waiting for upload to complete…")
+            file_input.set_input_files(local_path)
+            print("Video file set. Waiting for upload…")
 
-        # ── 5. Wait for upload ────────────────────────────────────────────
-        try:
-            page.wait_for_selector(
-                '[data-testid="progressBar"]', state="visible", timeout=20000
-            )
-            print("Upload started (progress bar visible).")
-            page.wait_for_selector(
-                '[data-testid="progressBar"]', state="detached", timeout=300000
-            )
-            print("Upload complete (progress bar gone).")
-        except PWTimeout:
-            print("Warning: progress bar not detected or timed out; continuing.")
-
-        page.wait_for_timeout(5000)
-        wait_for_mask_gone(page, timeout=15000)
-
-        # ── 6. Submit post ────────────────────────────────────────────────
-        print("Submitting post…")
-        try:
-            page.wait_for_selector(
-                '[data-testid="tweetButton"]:not([aria-disabled="true"])',
-                state="attached",
-                timeout=15000,
-            )
-        except PWTimeout:
-            print("Warning: tweetButton disabled check timed out; trying anyway.")
-
-        page.wait_for_timeout(1000)
-
-        clicked = page.evaluate("""
-            () => {
-                const btn = document.querySelector('[data-testid="tweetButton"]');
-                if (btn) {
-                    btn.click();
-                    return true;
-                }
-                return false;
-            }
-        """)
-
-        if not clicked:
-            sys.exit("Post button not found in DOM.")
-
-        print("Post button clicked.")
-
-        # ── 7. Confirm submission ─────────────────────────────────────────
-        try:
-            page.wait_for_url(
-                lambda url: "/home" in url or "/compose" not in url,
-                timeout=20000,
-            )
-            print("Post submitted successfully — navigated away from compose.")
-        except PWTimeout:
-            print("No navigation detected; checking for compose closure…")
+            # ── 5. Wait for upload ────────────────────────────────────────
+            # Wait for progress bar to appear (confirms upload started)
+            progress_appeared = False
             try:
                 page.wait_for_selector(
-                    '[data-testid="tweetTextarea_0"]', state="detached", timeout=5000
+                    '[data-testid="progressBar"]', state="visible", timeout=25000
                 )
-                print("Compose textarea gone — post likely submitted.")
+                progress_appeared = True
+                print("Upload started (progress bar visible).")
             except PWTimeout:
-                print("Warning: could not confirm submission. Manual check advised.")
+                print("Progress bar did not appear — upload may have started silently.")
 
-        page.wait_for_timeout(3000)
-        browser.close()
+            if progress_appeared:
+                try:
+                    page.wait_for_selector(
+                        '[data-testid="progressBar"]', state="detached", timeout=300000
+                    )
+                    print("Upload complete (progress bar gone).")
+                except PWTimeout:
+                    print("Warning: upload progress bar timed out after 5 min; continuing.")
+            else:
+                # Give it extra time if progress bar never appeared
+                page.wait_for_timeout(15000)
+
+            # Extra buffer for X server-side processing
+            page.wait_for_timeout(5000)
+            wait_for_mask_gone(page, timeout=20000)
+
+            # ── 6. Submit post ────────────────────────────────────────────
+            print("Submitting post…")
+
+            # Wait for button to be enabled
+            try:
+                page.wait_for_selector(
+                    '[data-testid="tweetButton"]:not([aria-disabled="true"])',
+                    state="attached",
+                    timeout=20000,
+                )
+                print("Post button is enabled.")
+            except PWTimeout:
+                print("Warning: tweetButton still shows disabled; trying anyway.")
+                save_debug_screenshot(page, "button_disabled")
+
+            page.wait_for_timeout(1000)
+
+            # JS click bypasses any residual pointer-event overlay
+            clicked = page.evaluate("""
+                () => {
+                    const btn = document.querySelector('[data-testid="tweetButton"]');
+                    if (btn) {
+                        btn.click();
+                        return true;
+                    }
+                    return false;
+                }
+            """)
+
+            if not clicked:
+                save_debug_screenshot(page, "button_not_found")
+                raise RuntimeError("Post button not found in DOM.")
+
+            print("Post button clicked.")
+
+            # ── 7. Confirm submission ─────────────────────────────────────
+            try:
+                page.wait_for_url(
+                    lambda url: "/home" in url or "/compose" not in url,
+                    timeout=25000,
+                )
+                print("Post confirmed — navigated away from compose.")
+            except PWTimeout:
+                # Check if compose closed (modal dismissed)
+                try:
+                    page.wait_for_selector(
+                        '[data-testid="tweetTextarea_0"]',
+                        state="detached",
+                        timeout=8000,
+                    )
+                    print("Compose closed — post likely submitted.")
+                except PWTimeout:
+                    save_debug_screenshot(page, "post_unconfirmed")
+                    print("Warning: could not confirm post. Manual check advised.")
+
+            page.wait_for_timeout(3000)
+
+        finally:
+            browser.close()
 
     print("Posted to X successfully.")
 
@@ -363,8 +489,9 @@ def post_video_to_x(local_path, caption_text):
 
 def run_one_post():
     """
-    Fetch one video, build caption, post it, move to processed.
-    Returns True if a post was made, False if no videos were available.
+    Fetch one video, post it, move to processed.
+    Returns True if posted, False if no videos available.
+    Retries up to MAX_RETRIES times on failure.
     """
     file_meta, local_path = fetch_video_from_drive()
     if file_meta is None:
@@ -386,12 +513,31 @@ def run_one_post():
     print(f"\nCaption:\n{caption}\n")
     print(f"Video: {local_path}\n")
 
-    try:
-        post_video_to_x(local_path, caption)
-    except Exception as e:
-        print(f"Posting failed: {e}")
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            if attempt > 1:
+                print(f"Retry attempt {attempt}/{MAX_RETRIES}…")
+                time.sleep(RETRY_WAIT_SEC)
+            post_video_to_x(local_path, caption)
+            last_error = None
+            break
+        except SystemExit:
+            # sys.exit() calls — don't retry, re-raise immediately
+            raise
+        except Exception as e:
+            last_error = e
+            print(f"Attempt {attempt} failed: {e}")
+
+    if last_error is not None:
+        print(f"All {MAX_RETRIES} attempts failed. Releasing claim.")
         release_claim(service, file_id, original_name)
-        raise
+        # Clean up local file
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        raise last_error
 
     move_to_processed(service, file_id, original_name)
 
@@ -407,12 +553,11 @@ def run_one_post():
 
 def sleep_with_countdown(seconds):
     """Sleep for `seconds`, printing a countdown every 60s."""
-    interval = 60
     remaining = seconds
     while remaining > 0:
-        chunk = min(interval, remaining)
-        mins = remaining // 60
-        print(f"  Next post in ~{mins} minute(s)… (sleeping {chunk}s)")
+        chunk = min(60, remaining)
+        mins, secs = divmod(remaining, 60)
+        print(f"  Next post in {mins}m {secs}s…")
         time.sleep(chunk)
         remaining -= chunk
 
@@ -435,24 +580,39 @@ def main():
         print("Running until no videos remain or job timeout is reached.")
 
     while True:
-        print(f"\n{'='*50}")
-        print(f"Post #{post_count + 1} starting at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
-        print(f"{'='*50}")
+        print(f"\n{'='*55}")
+        print(f"Post #{post_count + 1} | {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
+        print(f"{'='*55}")
 
-        posted = run_one_post()
+        try:
+            posted = run_one_post()
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"ERROR in post cycle: {e}")
+            print("Continuing scheduler — will retry next interval.")
+            post_count_failed = getattr(main, "_failed", 0) + 1
+            main._failed = post_count_failed
+            if post_count_failed >= 5:
+                sys.exit("Too many consecutive failures (5). Exiting.")
+            print(f"Sleeping {INTERVAL_MINUTES}m before next attempt…")
+            sleep_with_countdown(interval_seconds)
+            continue
+
+        # Reset failure counter on success
+        main._failed = 0
 
         if not posted:
             print("No videos left in upload folder. Exiting scheduler.")
             break
 
         post_count += 1
-        print(f"Post #{post_count} done.")
+        print(f"Post #{post_count} done ✓")
 
         if MAX_POSTS and post_count >= MAX_POSTS:
-            print(f"Reached MAX_POSTS={MAX_POSTS}. Exiting scheduler.")
+            print(f"Reached MAX_POSTS={MAX_POSTS}. Exiting.")
             break
 
-        # Sleep until next post
         print(f"\nSleeping {INTERVAL_MINUTES} minute(s) before next post…")
         sleep_with_countdown(interval_seconds)
 
